@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import functools
 from collections.abc import Callable
 from typing import Any
 
@@ -92,14 +93,18 @@ class ToolTimeoutWrapper:
         Uses concurrent.futures.ThreadPoolExecutor to run *fn* in a worker
         thread and blocks the calling thread for at most *timeout_seconds*.
 
+        The timeout is resolved at call time, so registering or updating a
+        per-tool override after wrapping still takes effect.
+
         If timeout_seconds is 0, *fn* is called directly with no enforcement.
 
         Raises:
             ToolTimeoutError: when *fn* does not return within the budget.
         """
-        timeout = self.timeout_for(tool_name)
 
+        @functools.wraps(fn)
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            timeout = self.timeout_for(tool_name)
             if not timeout:
                 return fn(*args, **kwargs)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -109,8 +114,6 @@ class ToolTimeoutWrapper:
                 except concurrent.futures.TimeoutError as exc:
                     raise ToolTimeoutError(tool_name, timeout) from exc
 
-        _wrapped.__name__ = getattr(fn, "__name__", tool_name)
-        _wrapped.__doc__ = getattr(fn, "__doc__", None)
         return _wrapped
 
     def timed(self, tool_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -137,14 +140,18 @@ class ToolTimeoutWrapper:
 
         Uses asyncio.wait_for to cancel the coroutine on expiry.
 
+        The timeout is resolved at call time, so registering or updating a
+        per-tool override after wrapping still takes effect.
+
         If timeout_seconds is 0, *fn* is awaited directly with no enforcement.
 
         Raises:
             ToolTimeoutError: when *fn* does not complete within the budget.
         """
-        timeout = self.timeout_for(tool_name)
 
+        @functools.wraps(fn)
         async def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            timeout = self.timeout_for(tool_name)
             if not timeout:
                 return await fn(*args, **kwargs)
             try:
@@ -152,13 +159,9 @@ class ToolTimeoutWrapper:
             except asyncio.TimeoutError as exc:
                 raise ToolTimeoutError(tool_name, timeout) from exc
 
-        _wrapped.__name__ = getattr(fn, "__name__", tool_name)
-        _wrapped.__doc__ = getattr(fn, "__doc__", None)
         return _wrapped
 
-    def timed_async(
-        self, tool_name: str
-    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def timed_async(self, tool_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Decorator that wraps an async function with timeout enforcement.
 
         Usage::

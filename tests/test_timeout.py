@@ -13,8 +13,8 @@ from tool_timeout_wrap import ToolTimeoutError, ToolTimeoutWrapper
 # Helpers
 # ---------------------------------------------------------------------------
 
-FAST_SLEEP = 0.01   # well within any timeout
-SLOW_SLEEP = 2.0    # exceeds all timeouts used in tests
+FAST_SLEEP = 0.01  # well within any timeout
+SLOW_SLEEP = 2.0  # exceeds all timeouts used in tests
 TIGHT_TIMEOUT = 0.15  # budget: slow fn will blow past this
 
 
@@ -339,3 +339,44 @@ def test_wrapper_default_timeout_zero_no_enforcement() -> None:
     wrapped = w.wrap("any_tool", fn)
     assert wrapped(5) == 10
     assert calls == [5]
+
+
+def test_wrap_preserves_function_metadata() -> None:
+    """functools.wraps preserves name, doc, signature, and __wrapped__."""
+    import inspect
+
+    def documented(a: int, b: str = "x") -> tuple[int, str]:
+        """Original docstring."""
+        return a, b
+
+    w = ToolTimeoutWrapper(default_timeout=1.0)
+    wrapped = w.wrap("documented_tool", documented)
+
+    assert wrapped.__name__ == "documented"
+    assert wrapped.__doc__ == "Original docstring."
+    assert wrapped.__wrapped__ is documented
+    # the real signature is preserved, not (*args, **kwargs)
+    params = list(inspect.signature(wrapped).parameters)
+    assert params == ["a", "b"]
+
+
+def test_wrap_resolves_timeout_at_call_time() -> None:
+    """Registering a tighter timeout after wrapping still takes effect."""
+    w = ToolTimeoutWrapper(default_timeout=30.0)
+    wrapped = w.wrap("late_tool", slow_fn)
+    # override registered AFTER the function was wrapped
+    w.register("late_tool", TIGHT_TIMEOUT)
+    with pytest.raises(ToolTimeoutError) as exc_info:
+        wrapped()
+    assert exc_info.value.timeout_seconds == TIGHT_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_wrap_async_resolves_timeout_at_call_time() -> None:
+    """Registering a tighter timeout after async wrapping still takes effect."""
+    w = ToolTimeoutWrapper(default_timeout=30.0)
+    wrapped = w.wrap_async("late_async_tool", slow_async_fn)
+    w.register("late_async_tool", TIGHT_TIMEOUT)
+    with pytest.raises(ToolTimeoutError) as exc_info:
+        await wrapped()
+    assert exc_info.value.timeout_seconds == TIGHT_TIMEOUT

@@ -1,81 +1,110 @@
-# token-budget-py
+# tool-timeout-wrap
 
-[![PyPI](https://img.shields.io/pypi/v/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![Python](https://img.shields.io/pypi/pyversions/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
+[![PyPI](https://img.shields.io/pypi/v/tool-timeout-wrap.svg)](https://pypi.org/project/tool-timeout-wrap/)
+[![Python](https://img.shields.io/pypi/pyversions/tool-timeout-wrap.svg)](https://pypi.org/project/tool-timeout-wrap/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Thread-safe shared token + USD budget for concurrent LLM tasks.**
+**Wrap sync and async tool functions with per-tool timeouts.**
 
-Fan-out workloads — agents, parallel summarizers, batch evals — race many
-tasks to consume from one shared budget. This library is a small,
-zero-dependency counter with two axes (tokens, USD) that returns
-`BudgetExceeded` when a record would push past a configured cap.
+Agent and LLM tool calls can hang: a flaky HTTP request, a runaway loop, a
+slow subprocess. This library puts a wall-clock deadline on every tool call
+and raises `ToolTimeoutError` when a tool exceeds its budget — without
+requiring cooperative `check()` calls inside the function body.
 
-Sibling to the Rust crate
-[`token-budget-pool`](https://crates.io/crates/token-budget-pool).
+Zero runtime dependencies (stdlib only: `threading`, `asyncio`,
+`concurrent.futures`).
 
 ## Install
 
 ```bash
-pip install token-budget-py
+pip install tool-timeout-wrap
 ```
 
 ## Use
 
 ```python
-from token_budget import BudgetPool, BudgetExceeded
+from tool_timeout_wrap import ToolTimeoutWrapper, ToolTimeoutError
 
-pool = BudgetPool(token_cap=1_000_000, usd_cap=10.0)
+wrapper = ToolTimeoutWrapper(default_timeout=10.0)
+wrapper.register("slow_search", timeout_seconds=3.0)
 
+
+@wrapper.timed("slow_search")
+def slow_search(query: str) -> list[str]:
+    ...  # raises ToolTimeoutError if it takes more than 3s
+
+
+@wrapper.timed_async("fetch_url")
+async def fetch_url(url: str) -> str:
+    ...  # raises ToolTimeoutError if it takes more than 10s (the default)
+```
+
+Catch the timeout where you dispatch tools:
+
+```python
 try:
-    pool.record(tokens=1200, usd=0.0036)
-except BudgetExceeded as e:
-    # tell this worker to skip
-    print(f"out of budget: {e}")
+    results = slow_search("python timeouts")
+except ToolTimeoutError as e:
+    print(f"{e.tool_name} exceeded {e.timeout_seconds}s")
 ```
 
-Two-phase commit (reserve before the LLM call, commit the actual usage):
+You can also wrap an existing function without a decorator:
 
 ```python
-with pool.reserve(tokens=2000, usd=0.012) as r:
-    result = call_llm(prompt)
-    r.commit(tokens=result.usage.total_tokens, usd=result.cost_usd)
+def search(query: str) -> list[str]:
+    ...
+
+wrapped_search = wrapper.wrap("slow_search", search)
+wrapped_fetch = wrapper.wrap_async("fetch_url", fetch_url)
 ```
 
-If the `with` block exits without `r.commit()` (e.g. the LLM call raised),
-the reservation is auto-released — no orphaned slots.
+## Timeout resolution
 
-Either axis is optional:
+Each tool's budget is the registered per-tool override when present,
+otherwise `default_timeout`:
 
 ```python
-only_tokens = BudgetPool(token_cap=500_000)        # USD unbounded
-only_usd    = BudgetPool(usd_cap=5.0)              # tokens unbounded
-unbounded   = BudgetPool()                         # both unbounded (counter only)
+wrapper = ToolTimeoutWrapper(default_timeout=30.0)
+wrapper.register("alpha", 1.0)
+
+wrapper.timeout_for("alpha")    # 1.0  (override)
+wrapper.timeout_for("beta")     # 30.0 (default)
+wrapper.registered()            # {"alpha": 1.0}
 ```
 
-Atomic read of current state:
+Overrides are resolved at call time, so calling `register()` after a function
+is wrapped still takes effect.
+
+Setting a timeout to `0` disables enforcement for that tool — the function is
+called directly with no overhead:
 
 ```python
-snap = pool.snapshot()
-snap.tokens_used         # 1200
-snap.usd_remaining       # 9.9964
-snap.tokens_remaining    # 998800 (cap - used - reserved)
+wrapper.register("trusted_tool", 0)         # no timeout for this tool
+no_limit = ToolTimeoutWrapper(default_timeout=0)  # no timeout anywhere
 ```
+
+## How it works
+
+- **Sync** (`wrap`, `timed`): runs the function in a
+  `concurrent.futures.ThreadPoolExecutor` worker and blocks the calling thread
+  for at most `timeout_seconds`. The calling thread is freed on expiry even if
+  the function body never yields.
+- **Async** (`wrap_async`, `timed_async`): uses `asyncio.wait_for`, which
+  cancels the coroutine when the budget is exceeded.
+
+In both cases an exception raised inside the wrapped function (other than the
+timeout) propagates unchanged.
 
 ## What it does NOT do
 
-- No async runtime lock-in. Works under `asyncio`, `trio`, threads, sync.
-  The internal lock is a plain `threading.Lock` (held only for the
-  microseconds of a counter update).
-- No HTTP. Doesn't talk to any LLM provider.
-- No cost calculation. Wrap a cost calculator that returns USD per call
-  and feed the result into `record`. (See `claude-cost`, `openai-cost`,
-  `gemini-cost`, `bedrock-cost` on crates.io for Rust cost calculators
-  with the same authorship.)
-- No persistence. Counts live in process. For multi-process / multi-host
-  budgets, wrap a Redis or DB increment instead.
-- No automatic rollover. Call `pool.reset()` from your own cron / time
-  loop if you want a periodic window.
+- **It cannot kill a runaway sync function.** A timed-out sync call frees the
+  *calling* thread, but the worker thread keeps running until the function
+  returns — Python has no safe way to forcibly terminate a thread. Use this to
+  bound how long a caller waits, not to reclaim CPU from a hot loop.
+- **No retries, no backoff.** It raises `ToolTimeoutError`; retry policy is
+  yours.
+- **No HTTP / provider logic.** It wraps any callable; it does not talk to any
+  LLM provider.
 
 ## License
 
